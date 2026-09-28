@@ -836,6 +836,8 @@ class Member:
     def OD(self):
         if self.is_tube:
             return float(self.group.OD)
+        elif self.is_cone:
+            return float(self.group.section.OD_L)
     @property
     def OD_L(self):
         if self.is_cone:
@@ -1216,18 +1218,31 @@ class Group:
         - New list of GroupSegment objects
         - New segment instances (no shared references)
         - Same section/geometry/material values
+        - Any section referenced by a segment is cloned too, under a new section id
         - Optionally added to model_out
         """
-
-        # Create the new group
         new_group = Group(new_id, model_out)
 
-        # Deep-copy each segment into a brand‑new GroupSegment
+        cloned_sections = {}   # old section_id -> new section_id (segments may share a section)
+
         for i, s in enumerate(self.segments, start=1):
-            seg = GroupSegment( index=i,section_id=s.section_id, OD=s.OD, _THK=s.THK, E=s.E, G=s.G,FY=s.FY, Ky=s.Ky, Kz=s.Kz, flooded=s.flooded, density=s.density, segment_ratio=s.segment_ratio, model= model_out)
+            new_section_id = s.section_id
+
+            if s.section_id != "":
+                if s.section_id not in cloned_sections:
+                    new_sec_id = aux.generate_new_section(s.section_id, model_out.sections)
+                    model_out.sections[s.section_id].clone_section(
+                        model_out, new_sec_id, add_to_model=add_to_model
+                    )
+                    cloned_sections[s.section_id] = new_sec_id
+                new_section_id = cloned_sections[s.section_id]
+
+            seg = GroupSegment(index=i, section_id=new_section_id, OD=s.OD, _THK=s.THK,
+                            E=s.E, G=s.G, FY=s.FY, Ky=s.Ky, Kz=s.Kz,
+                            flooded=s.flooded, density=s.density,
+                            segment_ratio=s.segment_ratio, model=model_out)
             new_group.add_segment(seg)
 
-        # Optionally register in the output model
         if add_to_model:
             model_out.add_group(new_group)
 

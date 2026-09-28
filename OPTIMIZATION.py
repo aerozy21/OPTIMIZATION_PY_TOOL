@@ -14,10 +14,13 @@ import re
 import xlwings as xw
 import time
 from tabulate import tabulate
+import copy
 
 
 start_time = time.time()
-
+avoid = pd.read_csv("avoid_groups.csv", dtype=str)
+UPPER_SPLASH = 8.2
+LOWER_SPLASH = -4.3
 
 # Use a recursive pattern to search in all subdirectories
 patterns = ["**/*sac.inp", "**/sacinp.*"]
@@ -35,8 +38,20 @@ if SACSInputFile is None:
 
 model = SACSModel(SACSInputFile)
 z_max = 21.5
+MEMBER_ZONES_CSV = "member_zones.csv"
+
+# DOUBLE CHECKS IF GROUP ZONES ARE UNIQUE TO EACH ZONE:
+correct_model_zones = False
+if correct_model_zones:
+    member_zones, model_out, group_map = s.build_member_zones( model, UPPER_SPLASH, LOWER_SPLASH, correct_model=correct_model_zones)
+    section_zones, model_out, section_map, group_map_II = s.build_section_zones( model_out, UPPER_SPLASH, LOWER_SPLASH, correct_model=correct_model_zones)
+    model_out_path = model.path.lower().replace("sac", "OUT_sac")
+    model_out.write_model(model.path, "OUT")
 
 df = pd.read_csv("governing_UCs_df.csv")
+
+
+member_zones = s.get_member_zones(model, UPPER_SPLASH, LOWER_SPLASH, z_max, csv_path=MEMBER_ZONES_CSV)
 
 # Create a working copy
 working_df = df.copy()
@@ -56,12 +71,25 @@ UC_FLS_THRESHOLD = 0.30   # fatigue
 
 # Initialize dictionary to collect all updated members across loops
 updated_members = {}
-
+avoid = pd.read_csv("avoid_groups.csv", dtype=str)
+avoid_od_initials  = tuple(avoid["OD"].dropna().str.strip().loc[lambda s: s != ""])
+avoid_thk_initials = tuple(avoid["THK"].dropna().str.strip().loc[lambda s: s != ""])
 # Loop through each member
 for member_id in members_to_optimize:
     if member_id in processed_member_ids:
         continue
+
     member = model.members[member_id]
+    if not member.is_tube:
+        continue
+
+    # groups whose initials are on the avoid list
+    skip_od  = member.group_id.startswith(avoid_od_initials)
+    skip_thk = member.group_id.startswith(avoid_thk_initials)
+    # nothing left to optimize for this member
+    if skip_od and skip_thk:
+        continue
+
     is_leg = member.is_leg
     colinear_members = s.get_colinear_members(model, member, z_max=21.5, include_cones=True)[0]
     colinear_member_ids = [colinear_member.Id for colinear_member in colinear_members]
@@ -72,17 +100,22 @@ for member_id in members_to_optimize:
     colinear_joints, colinear_joint_ids = s.get_colinear_joints_in_order(colinear_members)
     print(colinear_joint_ids)
     
-    # Dictionary containing the relevant properties for each colinear member
-    colinear_members_data = {
-        colinear_member.Id: {
-            "UC_max": uc_lookup.get(colinear_member.Id),
-            "UC_FLS_max": uc_FLS_lookup.get(colinear_member.Id),
-            "OD": colinear_member.OD,
-            "THK": colinear_member.THK,
-            "OD_THK": colinear_member.OD / colinear_member.THK
+    colinear_members_data = {}
+    for cm in colinear_members:
+        j1, j2 = cm.Id[:4], cm.Id[-4:]
+
+        colinear_members_data[cm.Id] = {
+            "UC_max": uc_lookup.get(cm.Id),
+            "UC_FLS_max": uc_FLS_lookup.get(cm.Id),
+            "is_cone": cm.is_cone,
+            "OD": None if cm.is_cone else cm.OD,
+            "THK": cm.THK,                                  # a cone's own thickness
+            "OD_L": cm.OD_L if cm.is_cone else None,
+            "OD_S": cm.OD_S if cm.is_cone else None,
+            "OD_THK": (max(cm.OD_L, cm.OD_S) if cm.is_cone else cm.OD) / cm.THK,
+            "skip_od": cm.group_id.startswith(avoid_od_initials),
+            "skip_thk": cm.group_id.startswith(avoid_thk_initials),
         }
-        for colinear_member in colinear_members
-    }
 
     # Dictionary: {joint_id: [list of brace data dictionaries]}
     brace_member_data = {}
@@ -122,14 +155,13 @@ for member_id in members_to_optimize:
             if chord.Id not in colinear_member_ids
         ]
 
+    final_colinear = s.get_final_colinear_sections(colinear_members_data, brace_member_data, chord_member_data, is_leg)
     print("COLINEAR DATA:")
     print(colinear_members_data)
     print("BRACE MEMBER DATA:")
     print(brace_member_data)
     print("CHORD MEMBER DATA:")
     print(chord_member_data)
-
-    final_colinear = s.get_final_colinear_sections(colinear_members_data, brace_member_data, chord_member_data, is_leg)
     print("UPDATED SECTIONS:")
     print(final_colinear)
     
@@ -137,6 +169,17 @@ for member_id in members_to_optimize:
     updated_members.update(final_colinear)
     
     a = 1
+
+
+
+print(updated_members)
+
+updated_members_df = pd.DataFrame.from_dict(updated_members, orient="index")
+updated_members_df.index.name = "member_id"
+updated_members_df.to_csv("updated_members.csv")
+
+model_out, changes = s.apply_updated_sections(model, updated_members, member_zones)
+model_out.write_model(model.path, "OUT")
 
 end_time = time.time()
 elapsed_time = end_time - start_time  # Calculate elapsed time
