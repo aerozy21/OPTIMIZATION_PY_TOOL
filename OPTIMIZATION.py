@@ -1,4 +1,5 @@
 from SACS_API import *
+from AUX_FUNCTIONS import *
 import math
 import sacs_extension as s
 import numpy as np
@@ -22,6 +23,7 @@ avoid = pd.read_csv("avoid_groups.csv", dtype=str)
 UPPER_SPLASH = 8.2
 LOWER_SPLASH = -4.3
 
+# *********************** MAIN CODE ***************
 # Use a recursive pattern to search in all subdirectories
 patterns = ["**/*sac.inp", "**/sacinp.*"]
 SACSInputFile = None
@@ -51,7 +53,7 @@ if correct_model_zones:
 df = pd.read_csv("governing_UCs_df.csv")
 
 
-member_zones = s.get_member_zones(model, UPPER_SPLASH, LOWER_SPLASH, z_max, csv_path=MEMBER_ZONES_CSV)
+member_zones = get_member_zones(model, UPPER_SPLASH, LOWER_SPLASH, z_max, csv_path=MEMBER_ZONES_CSV)
 
 # Create a working copy
 working_df = df.copy()
@@ -115,6 +117,8 @@ for member_id in members_to_optimize:
             "OD_THK": (max(cm.OD_L, cm.OD_S) if cm.is_cone else cm.OD) / cm.THK,
             "skip_od": cm.group_id.startswith(avoid_od_initials),
             "skip_thk": cm.group_id.startswith(avoid_thk_initials),
+            "group_id": cm.group_id,
+            "is_joint": s.is_joint(cm.joint1, z_max) or s.is_joint(cm.joint2, z_max),   # Class 2 required
         }
 
     # Dictionary: {joint_id: [list of brace data dictionaries]}
@@ -155,7 +159,7 @@ for member_id in members_to_optimize:
             if chord.Id not in colinear_member_ids
         ]
 
-    final_colinear = s.get_final_colinear_sections(colinear_members_data, brace_member_data, chord_member_data, is_leg)
+    final_colinear = get_final_colinear_sections(colinear_members_data, brace_member_data, chord_member_data, is_leg)
     print("COLINEAR DATA:")
     print(colinear_members_data)
     print("BRACE MEMBER DATA:")
@@ -178,7 +182,7 @@ updated_members_df = pd.DataFrame.from_dict(updated_members, orient="index")
 updated_members_df.index.name = "member_id"
 updated_members_df.to_csv("updated_members.csv")
 
-model_out, changes = s.apply_updated_sections(model, updated_members, member_zones)
+model_out, changes = apply_updated_sections(model, updated_members, member_zones)
 model_out.write_model(model.path, "OUT")
 
 end_time = time.time()

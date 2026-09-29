@@ -504,7 +504,7 @@ class Section:
         if self.stype == "TUB":
             new_sec = Section(section_id=new_id, stype="TUB",  OD=self.OD, THK=self.THK   )
         elif self.stype == "CON":
-            new_sec = Section(section_id=new_id, stype="CON",OD_L=self.OD_L, OD_S=self.OD_S, THK1=self.THK1,THK2=self.THK2)
+            new_sec = Section(section_id=new_id, stype="CON", OD_L=self.OD_L, OD_S=self.OD_S,THK=self.THK, THK1=self.THK1, THK2=self.THK2)
         else:
             raise ValueError(f"Unsupported section type '{self.stype}'")
         # Optionally register in the model
