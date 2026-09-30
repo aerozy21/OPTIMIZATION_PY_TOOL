@@ -30,6 +30,8 @@ SACSInputFile = None
 
 for pattern in patterns:
     for path in glob.glob(pattern, recursive=True):
+        if "OUT" in os.path.basename(path).upper():
+            continue  # skip output models written by previous runs
         SACSInputFile = path
         print(f'Found file: {SACSInputFile}')
         break  # Stop after finding the first file for this pattern
@@ -39,6 +41,8 @@ if SACSInputFile is None:
     print("No matching file found.")
 
 model = SACSModel(SACSInputFile)
+
+
 z_max = 21.5
 MEMBER_ZONES_CSV = "member_zones.csv"
 
@@ -57,22 +61,26 @@ member_zones = get_member_zones(model, UPPER_SPLASH, LOWER_SPLASH, z_max, csv_pa
 
 # Create a working copy
 working_df = df.copy()
-# Create UC lookup from the dataframe
-uc_lookup = ( working_df.dropna(subset=["member_id"]).set_index("member_id")["UC_max"].to_dict())
-uc_FLS_lookup = ( working_df.dropna(subset=["member_id"]).set_index("member_id")["Max_Fatigue_UC"].to_dict())
+# Create UC lookups from the dataframe
+uc_df = working_df.dropna(subset=["member_id"]).set_index("member_id")
+uc_lookup = uc_df["UC_max"].to_dict()
+uc_FLS_lookup = uc_df["Max_Fatigue_UC"].to_dict()
+# Non-fatigue UC: governing of strength and lift
+uc_SL_lookup = uc_df[["Max_Strength_UC", "Max_Lift_UC"]].max(axis=1).to_dict()
 
-# Identify members with UC_max < 0.4
+# Identify members with UC_max < 1
 members_to_optimize = (working_df.loc[working_df["UC_max"] < 1, "member_id"].dropna().unique())
 print(f"Members to optimize: {len(members_to_optimize)}")
 
 
 processed_member_ids = set()
-# Thresholds (placeholders, set to your criteria)
-UC_STRENGTH_THRESHOLD  = 0.50   # strength / lift
-UC_FLS_THRESHOLD = 0.30   # fatigue
 
 # Initialize dictionary to collect all updated members across loops
 updated_members = {}
+# Logs of cone insertion and ring candidates (accepted and skipped)
+cone_log = []
+ring_log = []
+
 avoid = pd.read_csv("avoid_groups.csv", dtype=str)
 avoid_od_initials  = tuple(avoid["OD"].dropna().str.strip().loc[lambda s: s != ""])
 avoid_thk_initials = tuple(avoid["THK"].dropna().str.strip().loc[lambda s: s != ""])
@@ -109,6 +117,7 @@ for member_id in members_to_optimize:
         colinear_members_data[cm.Id] = {
             "UC_max": uc_lookup.get(cm.Id),
             "UC_FLS_max": uc_FLS_lookup.get(cm.Id),
+            "UC_SL": uc_SL_lookup.get(cm.Id),                 # strength / lift only
             "is_cone": cm.is_cone,
             "OD": None if cm.is_cone else cm.OD,
             "THK": cm.THK,                                  # a cone's own thickness
@@ -119,6 +128,7 @@ for member_id in members_to_optimize:
             "skip_thk": cm.group_id.startswith(avoid_thk_initials),
             "group_id": cm.group_id,
             "is_joint": s.is_joint(cm.joint1, z_max) or s.is_joint(cm.joint2, z_max),   # Class 2 required
+            "length": cm.length,                                                          # m
         }
 
     # Dictionary: {joint_id: [list of brace data dictionaries]}
@@ -152,14 +162,19 @@ for member_id in members_to_optimize:
                 "member_id": chord.Id,
                 "OD": chord.OD,
                 "THK": chord.THK,
+                "is_leg": chord.is_leg,
                 "chord_UCmax": uc_lookup.get(chord.Id),
+                "chord_UC_SL": uc_SL_lookup.get(chord.Id),       # strength / lift only
                 "chord_FLS_UCmax": uc_FLS_lookup.get(chord.Id)
             }
             for chord in chord_objects
             if chord.Id not in colinear_member_ids
         ]
-
-    final_colinear = get_final_colinear_sections(colinear_members_data, brace_member_data, chord_member_data, is_leg)
+    final_colinear = get_final_colinear_sections(colinear_members_data, brace_member_data,
+                                                 chord_member_data, is_leg,
+                                                 chain_joint_ids=colinear_joint_ids,
+                                                 cone_log=cone_log,
+                                                 ring_log=ring_log)
     print("COLINEAR DATA:")
     print(colinear_members_data)
     print("BRACE MEMBER DATA:")
@@ -182,8 +197,16 @@ updated_members_df = pd.DataFrame.from_dict(updated_members, orient="index")
 updated_members_df.index.name = "member_id"
 updated_members_df.to_csv("updated_members.csv")
 
-model_out, changes = apply_updated_sections(model, updated_members, member_zones)
+model_out, changes = apply_updated_sections(model, updated_members, member_zones, cone_log=cone_log)
 model_out.write_model(model.path, "OUT")
+
+# Logs (cone log written after apply, so it includes the new member / group IDs)
+pd.DataFrame(cone_log).to_csv("cone_insertions.csv", index=False)
+
+ring_df = pd.DataFrame(ring_log)
+ring_df.to_csv("ring_log.csv", index=False)
+if not ring_df.empty:
+    ring_df[ring_df["status"] == "rings"].to_csv("irs_locations.csv", index=False)
 
 end_time = time.time()
 elapsed_time = end_time - start_time  # Calculate elapsed time

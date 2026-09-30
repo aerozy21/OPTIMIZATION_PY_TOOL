@@ -157,49 +157,67 @@ def compute_possible_reduction(OD, THK, strength_allowance, fatigue_allowance, t
 
 def get_final_colinear_sections(colinear_members_data, brace_member_data, chord_member_data,
                                 is_leg,
+                                chain_joint_ids=None,
                                 sl_threshold=0.5,
-                                fls_threshold=0.3):
-    """Returns a dictionary of only the colinear members that received section updates.
+                                fls_threshold=0.3,
+                                cone_log=None,
+                                ring_log=None,
+                                cone_length=1.0,          # m
+                                min_cone_reduction=0.20,  # fraction of end member OD
+                                clear_factor=0.75,        # x brace/chord OD at the far joint
+                                clear_allowance=0.20,     # m
+                                min_cone_spacing=2.0,     # m
+                                beta_min=0.20,            # OD_end / OD_chord floor at every chain end
+                                ring_sl_limit=0.70,       # leg ends: strength/lift UC gateway, stub AND leg
+                                ring_fls_trigger=1.0,     # leg ends WITHOUT rings: estimated FLS cap
+                                fls_cap=10.0,             # leg ends WITH rings: estimated FLS cap
+                                fls_exponent=10,          # FLS_new = FLS_old * (A_old / A_new) ** fls_exponent
+                                ring_beta_min=0.26,       # IRS: OD_end / OD_leg floor (Smedley)
+                                ring_beta_max=0.80,       # IRS: OD_end / OD_leg upper limit (Smedley)
+                                min_ring_reduction=0.20,  # IRS only if end OD drops by this fraction
+                                cone_min_ratio=1.05):     # a kept / inserted cone must have OD_L >= ratio * OD_S
+    """Returns a dictionary of the colinear members that received section updates.
 
-    - OD & THK are in cm, FY in kN/cm2.
-    - Tubular members are grouped into OD segments: runs of tubular members connected
-      through shared joints. Cones split the chain, so the tubulars on either side of a
-      cone have no OD dependency on each other.
-    - Tubular members are updated first:
-        * OD reduction per segment, decided from the segment's tubular UCs, plus the end
-          chords only where the segment reaches an extreme joint of the chain
-        * own THK reduction, from own UCs plus braces at their joints
-        * legs are outer-flushed (OD constant), other chains inner-flushed (ID shifts by od_red)
-        * OD / THK >= 18 checked on tubular members; Class 2 only for members that are
-          part of a joint (is_joint)
-    - Cones are adjusted afterwards, from the final tubular sections:
-        * large end (joint1) inner-flushed with its neighbour: OD_L = neighbour ID + 2 * cone THK
-        * small end (joint2) outer-flushed with its neighbour: OD_S = neighbour OD
-        * THK1 / THK2 = new THK of the tubular neighbour at joint1 / joint2
-        * cone THK reduced from its own UCs (plus braces at its joints) only when below
-          thresholds; otherwise left unchanged. Cones are never increased.
-        * if an end has no tubular neighbour, it keeps its own ID (large end) / OD (small end)
-          and its THK1 / THK2 is returned as None (leave unchanged)
-        * a cone must not flip: new OD_L > new OD_S
-    - new_FY = expected FY for the member's grade at its new THK.
-    - Failures:
-        * a failing tubular member drops its own segment's OD reduction
-        * a failing cone first drops its own THK reduction, then the OD reduction of the
-          segments on either side of it
-        * if a failure remains with no OD reduction left to drop, no member is updated.
-    - Returns only members whose section changed:
-      tubulars -> new_OD, new_THK, new_FY
-      cones    -> new_OD_L, new_OD_S, new_THK, new_THK1, new_THK2, new_FY
-      (unused keys are None).
+    Sizing:
+    - OD & THK in cm, FY in kN/cm2, lengths in m. ODs in whole cm (10 mm), THK in 0.5 cm.
+    - Tubular members grouped into OD segments split by cones; OD reduction per segment,
+      THK reduction per member; legs outer-flushed, braces inner-flushed.
+    - Area rule (compute_possible_reduction): strength and fatigue each capped at an
+      estimated UC of 1.0 (exponents 4 and 10).
+    - OD / THK >= 18 on tubulars; Class 2 only for joint members.
+    - At chain end joints: brace OD <= chord OD and OD / chord OD >= beta_min (floor).
+    - Cones follow the final tubular sections (large end at joint1 inner-flushed,
+      small end at joint2 outer-flushed), THK1 / THK2 from the neighbours, no flipping.
+
+    Leg ends of brace chains (stub reduction, with or without IRS):
+    - Stub = brace members from the leg joint up to the cone belonging to that end
+      (large end facing the leg); the end member alone if there is no such cone.
+    - Gateway: every stub member AND the leg at the joint have UC_SL < ring_sl_limit.
+    - The middle is sized without the stub (and its cone); the stub then reduces towards
+      the middle's ID. Two sizes are worked out, with the same rules as the standard sizing:
+        * without rings: strength via the area rule (highest UC_SL of stub and leg, cap 1.0),
+          fatigue cap ring_fls_trigger (stub and leg), beta >= beta_min
+        * with rings:    same strength, fatigue cap fls_cap, beta >= ring_beta_min
+      Both also floored by the cone step (OD_L >= cone_min_ratio * OD_S) when a cone stays,
+      and the end OD rounded UP to a whole cm (all floors are minimums).
+    - Rings are used when the ring size goes further than the ring-less one and passes:
+      final OD_end / OD_leg <= ring_beta_max, end OD reduction >= min_ring_reduction.
+      Otherwise the ring-less size is used ("reduced_no_IRS"); if neither reduces, the end
+      falls back to the normal behaviour.
+    - Stub reaches the middle ID -> cone removed; otherwise cone kept / inserted.
+    - All leg ends considered go to ring_log.
+
+    Cone insertion (other brace chain ends):
+    - Candidate: a chain end member fails the thresholds. Cone of cone_length cut from the
+      next member at the joint after the end member; no braces there; clearance and spacing
+      checks; remainder OD reduction >= min_cone_reduction * end OD.
+    - Returned as "insert_cone" rows keyed by the next member. Candidates go to cone_log.
     """
     end_ids = set(chord_member_data.keys())
     MIN_THK = 1.5
 
-    tubes = {m: d for m, d in colinear_members_data.items() if not d["is_cone"]}
-    cones = {m: d for m, d in colinear_members_data.items() if d["is_cone"]}
-
     def val(x):
-        return 0.0 if pd.isna(x) else x
+        return 0.0 if x is None or pd.isna(x) else x
 
     def ok(members):
         return all(val(uc) < sl_threshold and val(f) < fls_threshold for uc, f in members)
@@ -207,212 +225,715 @@ def get_final_colinear_sections(colinear_members_data, brace_member_data, chord_
     def joints_of(member_id):
         return (member_id[:4], member_id[-4:])
 
-    def neighbour_id(member_id, j):
-        # Tubular chain member sharing joint j with member_id (None if there isn't one)
-        return next((n for n in tubes if n != member_id and j in joints_of(n)), None)
-
     def fy_at(d, thk):
-        # Expected FY (kN/cm2) for the member's grade at thickness thk (cm)
         return expected_FY(grade_from_group(d["group_id"]), thk)
 
-    # --- 0. OD segments: tubular members connected through shared joints (cones split them) ---
-    seg_of = {}
-    segments = []
-    for start in tubes:
-        if start in seg_of:
-            continue
-        idx = len(segments)
-        seg_of[start] = idx
-        seg, stack = [], [start]
-        while stack:
-            cur = stack.pop()
-            seg.append(cur)
-            for j in joints_of(cur):
-                for n in tubes:
-                    if n not in seg_of and j in joints_of(n):
-                        seg_of[n] = idx
-                        stack.append(n)
-        segments.append(seg)
+    def area(od, thk):
+        return math.pi * thk * (od - thk)
 
-    # --- 1. OD Reduction Evaluation, per segment (tubular members only) ---
-    can_reduce_OD = []
-    for seg in segments:
-        if is_leg or any(tubes[m]["skip_od"] for m in seg):
-            can_reduce_OD.append(0.0)
-            continue
+    def max_chord_od(j):
+        return max((c["OD"] for c in chord_member_data.get(j, []) if c.get("OD")), default=None)
 
-        seg_joints = {j for m in seg for j in joints_of(m)}
-        chain = [(tubes[m]["UC_max"], tubes[m]["UC_FLS_max"]) for m in seg]
-        end_chords = [(c["chord_UCmax"], c["chord_FLS_UCmax"])
-                      for j in seg_joints & end_ids for c in chord_member_data.get(j, [])]
+    def tube_sec(od, thk, fy):
+        return {"new_OD": od, "new_OD_L": None, "new_OD_S": None,
+                "new_THK": thk, "new_THK1": None, "new_THK2": None, "new_FY": fy}
 
-        if ok(chain) and ok(end_chords):
-            group = chain + end_chords
-            strength_allowance = 1.0 - max(val(uc) for uc, _ in group)
-            fatigue_allowance = 1.0 - max(val(f) for _, f in group)
-            can_reduce_OD.append(min(
-                compute_possible_reduction(tubes[m]["OD"], tubes[m]["THK"], strength_allowance,
-                                           fatigue_allowance, "OD", tubes[m]["group_id"],
-                                           tubes[m]["is_joint"])
-                for m in seg
-            ))
-        else:
-            can_reduce_OD.append(0.0)
-
-    # --- 2. Individual Members (Local Thickness Reduction Evaluation, cones included) ---
-    can_reduce_THK = {}
-    for member_id, d in colinear_members_data.items():
-        if d["skip_thk"]:
-            can_reduce_THK[member_id] = 0.0
-            continue
-        joints = set(joints_of(member_id))
-        members = [(d["UC_max"], d["UC_FLS_max"])]
-        members += [(b["brace_UCmax"], b["brace_FLS_UCmax"])
-                    for j in joints for b in brace_member_data.get(j, [])]
-
-        if ok(members):
-            m_strength_allowance = 1.0 - max(val(uc) for uc, _ in members)
-            m_fatigue_allowance = 1.0 - max(val(f) for _, f in members)
-            ods = [d["OD_L"], d["OD_S"]] if d["is_cone"] else [d["OD"]]
-            can_reduce_THK[member_id] = min(
-                compute_possible_reduction(od, d["THK"], m_strength_allowance,
-                                           m_fatigue_allowance, "THK", d["group_id"], d["is_joint"])
-                for od in ods
-            )
-        else:
-            can_reduce_THK[member_id] = 0.0
-
-    # --- 3. Final Verification Step ---
-    def new_section(d, od_red, thk_red):
-        # Tubular members: legs outer-flushed, others inner-flushed
-        new_thk = max(d["THK"] - thk_red, MIN_THK)
-        if is_leg:
-            new_od = d["OD"]
-        else:
-            new_od = d["OD"] - 2 * d["THK"] - od_red + 2 * new_thk
-        return {"new_OD": new_od, "new_OD_L": None, "new_OD_S": None,
-                "new_THK": new_thk, "new_THK1": None, "new_THK2": None,
-                "new_FY": fy_at(d, new_thk)}
-
-    def cone_section(member_id, d, thk_red, tube_details):
-        # Cones: large end (joint1) inner-flushed, small end (joint2) outer-flushed
-        # with the neighbouring tubular members' new sections.
-        new_thk = max(d["THK"] - thk_red, MIN_THK)
-        n1 = neighbour_id(member_id, member_id[:4])
-        n2 = neighbour_id(member_id, member_id[-4:])
-
-        if n1:
-            s1 = tube_details[n1]
-            od_l = (s1["new_OD"] - 2 * s1["new_THK"]) + 2 * new_thk
-            thk1 = s1["new_THK"]
-        else:  # no tubular neighbour: keep the cone's own ID at the large end
-            od_l = (d["OD_L"] - 2 * d["THK"]) + 2 * new_thk
-            thk1 = None
-
-        if n2:
-            s2 = tube_details[n2]
-            od_s = s2["new_OD"]
-            thk2 = s2["new_THK"]
-        else:  # no tubular neighbour: keep own OD at the small end
-            od_s = d["OD_S"]
-            thk2 = None
-
+    def cone_sec(od_l, od_s, thk, thk1, thk2, fy):
         return {"new_OD": None, "new_OD_L": od_l, "new_OD_S": od_s,
-                "new_THK": new_thk, "new_THK1": thk1, "new_THK2": thk2,
-                "new_FY": fy_at(d, new_thk)}
+                "new_THK": thk, "new_THK1": thk1, "new_THK2": thk2, "new_FY": fy}
 
-    def is_changed(member_id, sec):
-        d = colinear_members_data[member_id]
-        if not d["is_cone"]:
-            return (sec["new_OD"], sec["new_THK"]) != (d["OD"], d["THK"])
-        if (sec["new_OD_L"], sec["new_OD_S"], sec["new_THK"]) != (d["OD_L"], d["OD_S"], d["THK"]):
-            return True
-        # THK1 / THK2 change when the neighbouring tubular THK changed
-        for key, j in (("new_THK1", member_id[:4]), ("new_THK2", member_id[-4:])):
-            n = neighbour_id(member_id, j)
-            if n and sec[key] != tubes[n]["THK"]:
+    # =====================================================================
+    # Sizing of one chain (data may contain virtual cone / remainder members)
+    # =====================================================================
+    def solve(data):
+        tubes = {m: d for m, d in data.items() if not d["is_cone"]}
+        cones = {m: d for m, d in data.items() if d["is_cone"]}
+
+        def neighbour_id(member_id, j):
+            return next((n for n in tubes if n != member_id and j in joints_of(n)), None)
+
+        # --- 0. OD segments: tubular members connected through shared joints ---
+        seg_of = {}
+        segments = []
+        for start in tubes:
+            if start in seg_of:
+                continue
+            idx = len(segments)
+            seg_of[start] = idx
+            seg, stack = [], [start]
+            while stack:
+                cur = stack.pop()
+                seg.append(cur)
+                for j in joints_of(cur):
+                    for n in tubes:
+                        if n not in seg_of and j in joints_of(n):
+                            seg_of[n] = idx
+                            stack.append(n)
+            segments.append(seg)
+
+        # --- 1. OD reduction per segment ---
+        can_reduce_OD = []
+        for seg in segments:
+            if is_leg or any(tubes[m]["skip_od"] for m in seg):
+                can_reduce_OD.append(0.0)
+                continue
+
+            seg_joints = {j for m in seg for j in joints_of(m)}
+            chain = [(tubes[m]["UC_max"], tubes[m]["UC_FLS_max"]) for m in seg]
+            end_chords = [(c["chord_UCmax"], c["chord_FLS_UCmax"])
+                          for j in seg_joints & end_ids for c in chord_member_data.get(j, [])]
+
+            if ok(chain) and ok(end_chords):
+                group = chain + end_chords
+                strength_allowance = 1.0 - max(val(uc) for uc, _ in group)
+                fatigue_allowance = 1.0 - max(val(f) for _, f in group)
+                red = min(
+                    compute_possible_reduction(tubes[m]["OD"], tubes[m]["THK"], strength_allowance,
+                                               fatigue_allowance, "OD", tubes[m]["group_id"],
+                                               tubes[m]["is_joint"])
+                    for m in seg
+                )
+                # beta floor at chain ends: OD_end / OD_chord >= beta_min
+                for m in seg:
+                    for j in set(joints_of(m)) & end_ids:
+                        dmax = max_chord_od(j)
+                        if dmax:
+                            red = min(red, max(0.0, math.floor(tubes[m]["OD"] - beta_min * dmax)))
+                can_reduce_OD.append(red)
+            else:
+                can_reduce_OD.append(0.0)
+
+        # --- 2. THK reduction per member (cones included) ---
+        can_reduce_THK = {}
+        for member_id, d in data.items():
+            if d["skip_thk"]:
+                can_reduce_THK[member_id] = 0.0
+                continue
+            joints = set(joints_of(member_id))
+            members = [(d["UC_max"], d["UC_FLS_max"])]
+            members += [(b["brace_UCmax"], b["brace_FLS_UCmax"])
+                        for j in joints for b in brace_member_data.get(j, [])]
+
+            if ok(members):
+                m_strength_allowance = 1.0 - max(val(uc) for uc, _ in members)
+                m_fatigue_allowance = 1.0 - max(val(f) for _, f in members)
+                ods = [d["OD_L"], d["OD_S"]] if d["is_cone"] else [d["OD"]]
+                can_reduce_THK[member_id] = min(
+                    compute_possible_reduction(od, d["THK"], m_strength_allowance,
+                                               m_fatigue_allowance, "THK", d["group_id"],
+                                               d["is_joint"])
+                    for od in ods
+                )
+            else:
+                can_reduce_THK[member_id] = 0.0
+
+        # --- 3. Verification ---
+        def new_section(d, od_red, thk_red):
+            new_thk = max(d["THK"] - thk_red, MIN_THK)
+            if is_leg:
+                new_od = d["OD"]
+            else:
+                new_od = d["OD"] - 2 * d["THK"] - od_red + 2 * new_thk
+            return tube_sec(new_od, new_thk, fy_at(d, new_thk))
+
+        def cone_section(member_id, d, thk_red, tube_details):
+            new_thk = max(d["THK"] - thk_red, MIN_THK)
+            n1 = neighbour_id(member_id, member_id[:4])
+            n2 = neighbour_id(member_id, member_id[-4:])
+
+            if n1:
+                s1 = tube_details[n1]
+                od_l = (s1["new_OD"] - 2 * s1["new_THK"]) + 2 * new_thk
+                thk1 = s1["new_THK"]
+            else:
+                od_l = (d["OD_L"] - 2 * d["THK"]) + 2 * new_thk
+                thk1 = None
+
+            if n2:
+                s2 = tube_details[n2]
+                od_s = s2["new_OD"]
+                thk2 = s2["new_THK"]
+            else:
+                od_s = d["OD_S"]
+                thk2 = None
+
+            return cone_sec(od_l, od_s, new_thk, thk1, thk2, fy_at(d, new_thk))
+
+        def is_changed(member_id, sec):
+            d = data[member_id]
+            if not d["is_cone"]:
+                return (sec["new_OD"], sec["new_THK"]) != (d["OD"], d["THK"])
+            if (sec["new_OD_L"], sec["new_OD_S"], sec["new_THK"]) != (d["OD_L"], d["OD_S"], d["THK"]):
                 return True
-        return False
+            for key, j in (("new_THK1", member_id[:4]), ("new_THK2", member_id[-4:])):
+                n = neighbour_id(member_id, j)
+                if n and sec[key] != tubes[n]["THK"]:
+                    return True
+            return False
 
-    def is_valid(member_id, sec):
-        d = colinear_members_data[member_id]
-        j1, j2 = joints_of(member_id)
-        if d["is_cone"]:
-            # Cone must not flip: large end stays larger than small end
-            if sec["new_OD_L"] <= sec["new_OD_S"]:
-                return False
-            od_at = {j1: sec["new_OD_L"], j2: sec["new_OD_S"]}
+        def is_valid(member_id, sec):
+            d = data[member_id]
+            j1, j2 = joints_of(member_id)
+            if d["is_cone"]:
+                if sec["new_OD_L"] <= sec["new_OD_S"]:
+                    return False
+                od_at = {j1: sec["new_OD_L"], j2: sec["new_OD_S"]}
+            else:
+                od_at = {j1: sec["new_OD"], j2: sec["new_OD"]}
+                d_t = sec["new_OD"] / sec["new_THK"]
+                ratio_valid = d_t >= 18.0
+                if d["is_joint"]:
+                    eps = np.sqrt(23.5 / sec["new_FY"])
+                    is_class2 = d_t <= 70 * eps**2
+                else:
+                    is_class2 = True
+                if not (ratio_valid and is_class2):
+                    return False
+
+            for j, od in od_at.items():
+                if j in end_ids:
+                    # brace OD <= chord OD, and OD / chord OD >= beta_min
+                    if any(od > c["OD"] for c in chord_member_data.get(j, []) if "OD" in c):
+                        return False
+                    dmax = max_chord_od(j)
+                    if dmax and od / dmax < beta_min - 1e-9:
+                        return False
+                else:
+                    if any(od < b["OD"] for b in brace_member_data.get(j, []) if "OD" in b):
+                        return False
+            return True
+
+        def compute_verification(seg_red):
+            details = {}
+            for member_id, d in tubes.items():
+                od_red = seg_red[seg_of[member_id]]
+                thk_red = can_reduce_THK[member_id]
+                sec = new_section(d, od_red, thk_red)
+                if (od_red or thk_red) and not is_valid(member_id, sec):
+                    return False, {}, {seg_of[member_id]}
+                details[member_id] = sec
+
+            tube_details = dict(details)
+            for member_id, d in cones.items():
+                for thk_red in (can_reduce_THK[member_id], 0.0):
+                    sec = cone_section(member_id, d, thk_red, tube_details)
+                    if not is_changed(member_id, sec) or is_valid(member_id, sec):
+                        break
+                else:
+                    adjacent = {seg_of[n] for n in (neighbour_id(member_id, j)
+                                                    for j in joints_of(member_id)) if n}
+                    return False, {}, adjacent
+                details[member_id] = sec
+
+            return True, details, set()
+
+        seg_red = list(can_reduce_OD)
+        while True:
+            passed, details, failed = compute_verification(seg_red)
+            if passed:
+                break
+            to_drop = {i for i in failed if seg_red[i] > 0}
+            if not to_drop:
+                return {}
+            for i in to_drop:
+                seg_red[i] = 0.0
+
+        return {member_id: sec for member_id, sec in details.items()
+                if is_changed(member_id, sec)}
+
+    def as_resize(result):
+        return {m: {**sec, "action": "resize"} for m, sec in result.items()}
+
+    # =====================================================================
+    # Base sizing
+    # =====================================================================
+    base = solve(colinear_members_data)
+
+    if is_leg or not chain_joint_ids or len(chain_joint_ids) < 3:
+        return as_resize(base)
+
+    data0 = colinear_members_data
+    ids = list(chain_joint_ids)
+
+    chain_members = []
+    for a, b in zip(ids, ids[1:]):
+        mid = next((m for m in data0 if set(joints_of(m)) == {a, b}), None)
+        if mid is None:
+            return as_resize(base)
+        chain_members.append(mid)
+
+    pos = {ids[0]: 0.0}
+    for (a, b), mid in zip(zip(ids, ids[1:]), chain_members):
+        pos[b] = pos[a] + data0[mid]["length"]
+
+    def other_joint(member_id, j):
+        a, b = joints_of(member_id)
+        return b if a == j else a
+
+    def span_of(a, b):
+        return (min(pos[a], pos[b]), max(pos[a], pos[b]))
+
+    def gap(s1, s2):
+        return max(s2[0] - s1[1], s1[0] - s2[1])
+
+    chain_name = f"{ids[0]}..{ids[-1]}"
+
+    # =====================================================================
+    # Cone insertion geometry check
+    # =====================================================================
+    def cone_geometry(end_id, e, data_base, taken_spans):
+        start = other_joint(end_id, e)
+        info = {"cone_start_joint": start, "next_member": None, "next_length": None}
+
+        if start in end_ids:
+            return None, "chain has a single member", info
+        if brace_member_data.get(start):
+            return None, "braces at cone start joint", info
+
+        nexts = [m for m in data_base if start in joints_of(m) and m != end_id]
+        if len(nexts) != 1:
+            return None, "no single next member", info
+        next_id = nexts[0]
+        nd = data_base[next_id]
+        info.update({"next_member": next_id, "next_length": nd["length"]})
+
+        if nd["is_cone"]:
+            return None, "next member is a cone", info
+        if nd["skip_od"]:
+            return None, "next member OD on avoid list", info
+
+        far = other_joint(next_id, start)
+        ods = [b["OD"] for b in brace_member_data.get(far, []) if b.get("OD")]
+        ods += [c["OD"] for c in chord_member_data.get(far, []) if c.get("OD")]
+        required = (clear_factor * max(ods) / 100 if ods else 0.0) + clear_allowance
+        remainder = nd["length"] - cone_length
+        if remainder < required:
+            return None, (f"next member too short: {remainder:.2f} m after cone, "
+                          f"{required:.2f} m needed"), info
+
+        direction = 1.0 if pos[far] > pos[start] else -1.0
+        span = tuple(sorted((pos[start], pos[start] + direction * cone_length)))
+        if any(gap(span, o) < min_cone_spacing for o in taken_spans):
+            return None, f"closer than {min_cone_spacing} m to another cone", info
+
+        return {"end_id": end_id, "next_id": next_id, "start": start, "far": far,
+                "span": span}, "", info
+
+    # =====================================================================
+    # 5. Leg end candidates (gateway)
+    # =====================================================================
+    ring_ends = {}
+    for side, e in ((0, ids[0]), (1, ids[-1])):
+        leg_chords = [c for c in chord_member_data.get(e, []) if c.get("is_leg")]
+        leg_ods = [c["OD"] for c in leg_chords if c.get("OD")]
+        if not leg_ods:
+            continue
+
+        seq = chain_members if side == 0 else chain_members[::-1]
+        end_m = seq[0]
+        ed = data0[end_m]
+
+        rec = {"chain": chain_name, "leg_joint": e,
+               "leg_members": " ".join(c["member_id"] for c in leg_chords),
+               "leg_OD_min": min(leg_ods), "leg_OD_max": max(leg_ods),
+               "leg_UC_SL": max((val(c.get("chord_UC_SL")) for c in leg_chords), default=0.0),
+               "leg_FLS_UC": max((val(c.get("chord_FLS_UCmax")) for c in leg_chords), default=0.0),
+               "end_member": end_m, "end_UC_SL": ed["UC_SL"],
+               "end_FLS_UC": ed["UC_FLS_max"], "end_OD": ed["OD"],
+               "OD_ratio_now": ed["OD"] / min(leg_ods) if ed["OD"] else None,
+               "status": "skipped", "reason": ""}
+
+        def ring_skip(reason):
+            rec["reason"] = reason
+            if ring_log is not None:
+                ring_log.append(rec)
+
+        if ed["is_cone"]:
+            ring_skip("end member is a cone")
+            continue
+
+        k = next((i for i, m in enumerate(seq) if data0[m]["is_cone"]), None)
+        if k is not None:
+            # the cone belongs to this end only if its large end (joint1) faces this end
+            cone_id = seq[k]
+            joint_before = e if k == 0 else next(j for j in joints_of(cone_id)
+                                                 if j in joints_of(seq[k - 1]))
+            if cone_id[:4] != joint_before:
+                k = None
+
+        if k is None:
+            stub, cone_m = [end_m], None
         else:
-            od_at = {j1: sec["new_OD"], j2: sec["new_OD"]}
-            d_t = sec["new_OD"] / sec["new_THK"]
+            stub, cone_m = seq[:k], seq[k]
 
-            # Check 1a: OD / THK >= 18 (tubular members only)
-            ratio_valid = d_t >= 18.0
-            # Check 1b: section at least Class 2 (joint members only)
-            if d["is_joint"]:
-                eps = np.sqrt(23.5 / sec["new_FY"])
-                is_class2 = d_t <= 70 * eps**2
-            else:
-                is_class2 = True
+        used = len(stub) + (1 if cone_m else 0)
+        rec.update({"stub": " ".join(stub), "cone_member": cone_m,
+                    "cone_type": "existing" if cone_m else "none"})
 
-            if not (ratio_valid and is_class2):
-                return False
+        if used >= len(chain_members):
+            ring_skip("stub and cone cover the whole chain")
+            continue
+        if any(data0[m]["skip_od"] for m in stub):
+            ring_skip("stub OD on avoid list")
+            continue
 
-        for j, od in od_at.items():
-            if j in end_ids:
-                # Check 2: at end joints, colinear OD must not exceed chord OD
-                if any(od > c["OD"] for c in chord_member_data.get(j, []) if "OD" in c):
-                    return False
-            else:
-                # Check 3: at middle joints, colinear OD must be >= attached brace OD
-                if any(od < b["OD"] for b in brace_member_data.get(j, []) if "OD" in b):
-                    return False
-        return True
+        # strength UC gateway: stub AND leg
+        too_high = [m for m in stub if not val(data0[m]["UC_SL"]) < ring_sl_limit]
+        too_high += [c["member_id"] for c in leg_chords
+                     if not val(c.get("chord_UC_SL")) < ring_sl_limit]
+        if too_high:
+            ring_skip(f"strength UC not below {ring_sl_limit}: {' '.join(too_high)}")
+            continue
 
-    def compute_verification(seg_red):
-        """Returns (passed, details, failed_segments)."""
-        details = {}
+        if side == 1 and 0 in ring_ends and used + ring_ends[0]["used"] >= len(chain_members):
+            ring_skip("overlaps the leg end at the other side")
+            continue
 
-        # 3a. Tubular members first, each with its own segment's OD reduction
-        for member_id, d in tubes.items():
-            od_red = seg_red[seg_of[member_id]]
-            thk_red = can_reduce_THK[member_id]
-            sec = new_section(d, od_red, thk_red)
-            if (od_red or thk_red) and not is_valid(member_id, sec):
-                return False, {}, {seg_of[member_id]}
-            details[member_id] = sec
+        start = ids[len(stub)] if side == 0 else ids[-1 - len(stub)]
+        boundary = ids[used] if side == 0 else ids[-1 - used]
+        ring_ends[side] = {"end_joint": e, "stub": stub, "cone": cone_m, "used": used,
+                           "start": start, "boundary": boundary,
+                           "leg_od_min": min(leg_ods), "leg_od_max": max(leg_ods),
+                           "leg_sl": rec["leg_UC_SL"], "leg_fls": rec["leg_FLS_UC"], "rec": rec}
 
-        # 3b. Cones afterwards: ends and THK1 / THK2 follow the final tubular sections;
-        #     drop the cone's own THK reduction if it fails
-        tube_details = dict(details)
-        for member_id, d in cones.items():
-            for thk_red in (can_reduce_THK[member_id], 0.0):
-                sec = cone_section(member_id, d, thk_red, tube_details)
-                if not is_changed(member_id, sec) or is_valid(member_id, sec):
-                    break
-            else:
-                adjacent = {seg_of[n] for n in (neighbour_id(member_id, j)
-                                                for j in joints_of(member_id)) if n}
-                return False, {}, adjacent
-            details[member_id] = sec
+    # =====================================================================
+    # 6. Cone planning and sizing (ends that are not leg-end candidates)
+    # =====================================================================
+    def plan_and_size(data_base, ring_sides, pending_log):
+        existing_cone_spans = [span_of(*joints_of(m)) for m, d in data_base.items() if d["is_cone"]]
 
-        return True, details, set()
+        plans = []
+        for side, e in ((0, ids[0]), (1, ids[-1])):
+            if side in ring_sides:
+                continue
+            ends = [m for m in data_base if e in joints_of(m)]
+            if len(ends) != 1:
+                continue
+            end_id = ends[0]
+            ed = data_base[end_id]
+            if ed["is_cone"] or ok([(ed["UC_max"], ed["UC_FLS_max"])]):
+                continue
 
-    seg_red = list(can_reduce_OD)
+            rec = {"chain": chain_name, "end_joint": e, "end_member": end_id,
+                   "end_UC": ed["UC_max"], "end_FLS_UC": ed["UC_FLS_max"], "end_OD": ed["OD"],
+                   "status": "skipped", "reason": ""}
+
+            plan, reason, info = cone_geometry(end_id, e, data_base,
+                                               existing_cone_spans + [p["span"] for p in plans])
+            rec.update(info)
+            if plan is None:
+                rec["reason"] = reason
+                pending_log.append(rec)
+                continue
+
+            vj = f"~{side:03d}"
+            plan.update({"rec": rec, "cone_id": f"{plan['start']}-{vj}",
+                         "rem_id": f"{vj}-{plan['far']}"})
+            plans.append(plan)
+
+        result = None
+        while plans:
+            data = dict(data_base)
+            for p in plans:
+                nd = data_base[p["next_id"]]
+                del data[p["next_id"]]
+                data[p["cone_id"]] = {**nd, "is_cone": True, "OD": None,
+                                      "OD_L": nd["OD"], "OD_S": nd["OD"],
+                                      "length": cone_length, "is_joint": False}
+                data[p["rem_id"]] = {**nd, "length": nd["length"] - cone_length}
+
+            result = solve(data)
+
+            dropped = []
+            for p in plans:
+                rem = result.get(p["rem_id"])
+                reduction = data_base[p["next_id"]]["OD"] - rem["new_OD"] if rem else 0.0
+                needed = min_cone_reduction * data_base[p["end_id"]]["OD"]
+                p["reduction"] = reduction
+                if reduction < needed or p["cone_id"] not in result:
+                    p["rec"]["reason"] = (f"OD reduction {reduction:.1f} cm below "
+                                          f"{needed:.1f} cm ({min_cone_reduction:.0%} of end OD)")
+                    dropped.append(p)
+
+            if not dropped:
+                break
+            for p in dropped:
+                pending_log.append(p["rec"])
+                plans.remove(p)
+
+        if not plans:
+            result = solve(data_base)
+
+        return plans, result
+
+    # =====================================================================
+    # 7. Leg end sizing (after the middle has been sized without the stubs)
+    # =====================================================================
+    def size_ring_ends(result, data_base, plans):
+        rows, failed = {}, {}
+        taken_spans = [span_of(*joints_of(m)) for m, d in data_base.items() if d["is_cone"]]
+        taken_spans += [p["span"] for p in plans]
+
+        for side, r in ring_ends.items():
+            rec = r["rec"]
+            b = r["boundary"]
+            end_m = r["stub"][0]
+            end_d = data0[end_m]
+            end_od = end_d["OD"]
+
+            # middle member at the boundary joint: its new section, or its current one
+            n = next((m for m, d in data_base.items()
+                      if b in joints_of(m) and not d["is_cone"]), None)
+            if n is None:
+                failed[side] = "no tubular middle member at the boundary joint"
+                continue
+            nd = data_base[n]
+            nsec = result.get(n) or tube_sec(nd["OD"], nd["THK"], fy_at(nd, nd["THK"]))
+            target_id = nsec["new_OD"] - 2 * nsec["new_THK"]
+
+            # --- strength floor (no ring credit): area rule, highest UC_SL of stub and leg ---
+            sl_gov = max([val(data0[m]["UC_SL"]) for m in r["stub"]] + [r["leg_sl"]])
+            strength_id = 0.0
+            for m in r["stub"]:
+                d = data0[m]
+                allowed = compute_possible_reduction(d["OD"], d["THK"], 1.0 - sl_gov, 1.0,
+                                                     "OD", d["group_id"], d["is_joint"])
+                strength_id = max(strength_id, d["OD"] - allowed - 2 * d["THK"])
+
+            # --- fatigue floor for a given cap: stub members and leg (via the end member) ---
+            #   A_new >= A_old * (FLS_old / cap) ** (1 / fls_exponent);  ID = A / (pi * THK) - THK
+            def fls_floor_id(cap):
+                fid = 0.0
+                for m in r["stub"]:
+                    d = data0[m]
+                    fls = val(d["UC_FLS_max"])
+                    if fls > 0:
+                        a_min = area(d["OD"], d["THK"]) * (fls / cap) ** (1 / fls_exponent)
+                        fid = max(fid, a_min / (math.pi * d["THK"]) - d["THK"])
+                if r["leg_fls"] > 0:
+                    a_min = area(end_od, end_d["THK"]) * (r["leg_fls"] / cap) ** (1 / fls_exponent)
+                    fid = max(fid, a_min / (math.pi * end_d["THK"]) - end_d["THK"])
+                return fid
+
+            def floor_id(beta):
+                # ID that gives the end member OD_end / OD_leg = beta (largest leg OD)
+                return beta * r["leg_od_max"] - 2 * end_d["THK"]
+
+            def round_id(x):
+                # stub reaching the middle keeps the middle's ID; otherwise round the
+                # end member OD UP to a whole cm (all floors are minimums)
+                if x <= target_id + 1e-6:
+                    return target_id
+                od = math.ceil(x + 2 * end_d["THK"] - 1e-6)
+                return od - 2 * end_d["THK"]
+
+            cone_thk = data0[r["cone"]]["THK"] if r["cone"] else nsec["new_THK"]
+
+            def size_for(beta, cap):
+                """Stub ID for a beta floor and fatigue cap; returns (new_id, governing)."""
+                floors = {"middle_ID": target_id, "strength": strength_id,
+                          "beta": floor_id(beta), "fatigue": fls_floor_id(cap)}
+                governing = max(floors, key=floors.get)
+                new_id = round_id(floors[governing])
+                if new_id > target_id + 1e-6:
+                    # a cone stays: keep a real step, OD_L >= cone_min_ratio * OD_S
+                    cone_floor = cone_min_ratio * nsec["new_OD"] - 2 * cone_thk
+                    if cone_floor > new_id:
+                        new_id = round_id(cone_floor)
+                        governing = "cone_step"
+                return new_id, governing
+
+            def stub_sizes(new_id):
+                s_rows = {}
+                for m in r["stub"]:
+                    d = data0[m]
+                    thk = d["THK"]
+                    new_od = new_id + 2 * thk
+                    new_fy = fy_at(d, thk)
+                    d_t = new_od / thk
+                    if d_t < 18.0:
+                        return None, f"{m} D/t {d_t:.1f} < 18"
+                    if d["is_joint"] and d_t > 70 * 23.5 / new_fy:
+                        return None, f"{m} not Class 2 at D/t {d_t:.1f}"
+                    for j in joints_of(m):
+                        if j in end_ids:
+                            if any(new_od > c["OD"] for c in chord_member_data.get(j, []) if c.get("OD")):
+                                return None, f"{m} OD larger than chord at {j}"
+                        elif any(new_od < bb["OD"] for bb in brace_member_data.get(j, []) if bb.get("OD")):
+                            return None, f"{m} OD smaller than a brace at {j}"
+                    s_rows[m] = {**tube_sec(new_od, thk, new_fy), "action": "resize"}
+                return s_rows, None
+
+            def fls_estimate(s_rows):
+                fb = 0.0
+                for m in r["stub"]:
+                    d = data0[m]
+                    factor = (area(d["OD"], d["THK"]) / area(s_rows[m]["new_OD"], d["THK"])) ** fls_exponent
+                    fb = max(fb, val(d["UC_FLS_max"]) * factor)
+                end_factor = (area(end_od, end_d["THK"]) /
+                              area(s_rows[end_m]["new_OD"], end_d["THK"])) ** fls_exponent
+                return fb, r["leg_fls"] * end_factor
+
+            def build(new_id):
+                """Stub rows plus the cone at this end. Returns (rows, reason, cone_action, cone_plan)."""
+                s_rows, reason = stub_sizes(new_id)
+                if reason:
+                    return None, reason, None, None
+                full = new_id <= target_id + 1e-6
+                stub_thk = data0[r["stub"][-1]]["THK"]
+
+                if full:
+                    if r["cone"]:
+                        cd = data0[r["cone"]]
+                        c_od = target_id + 2 * cd["THK"]
+                        if c_od / cd["THK"] < 18.0:
+                            return None, f"{r['cone']} as a tube: D/t {c_od / cd['THK']:.1f} < 18", None, None
+                        s_rows[r["cone"]] = {**tube_sec(c_od, cd["THK"], fy_at(cd, cd["THK"])),
+                                             "action": "cone_to_tube"}
+                        return s_rows, None, "existing cone converted to tube", None
+                    return s_rows, None, "no cone needed", None
+
+                if r["cone"]:
+                    cd = data0[r["cone"]]
+                    od_l = new_id + 2 * cd["THK"]
+                    od_s = nsec["new_OD"]
+                    if od_l <= od_s:
+                        return None, f"{r['cone']} would flip ({od_l:.1f} <= {od_s:.1f} cm)", None, None
+                    s_rows[r["cone"]] = {**cone_sec(od_l, od_s, cd["THK"], stub_thk,
+                                                    nsec["new_THK"], fy_at(cd, cd["THK"])),
+                                         "action": "resize"}
+                    return s_rows, None, "existing cone kept (resized)", None
+
+                plan, why, info = cone_geometry(end_m, r["end_joint"], data0, taken_spans)
+                if plan is None:
+                    return None, f"stub cannot reach middle ID and cone cannot be inserted: {why}", None, None
+                c_thk = nsec["new_THK"]
+                od_l = new_id + 2 * c_thk
+                od_s = nsec["new_OD"]
+                if od_l <= od_s:
+                    return None, f"planned cone would flip ({od_l:.1f} <= {od_s:.1f} cm)", None, None
+                cone_new = cone_sec(od_l, od_s, c_thk, stub_thk, nsec["new_THK"], fy_at(nd, c_thk))
+                row = {**nsec, "action": "insert_cone",
+                       "cone_start_joint": plan["start"], "cone_length": cone_length}
+                row.update({"cone_" + key: v for key, v in cone_new.items()})
+                s_rows[plan["next_id"]] = row
+                plan.update({"info": info, "od_l": od_l, "od_s": od_s, "thk": c_thk})
+                return s_rows, None, "cone inserted", plan
+
+            # --- the two sizes ---
+            id_plain, gov_plain = size_for(beta_min, ring_fls_trigger)     # without rings
+            id_ring, gov_ring = size_for(ring_beta_min, fls_cap)            # with rings
+
+            choice, ring_reason = None, None
+
+            # rings: only if they allow a further reduction and pass the ring checks
+            if id_ring < id_plain - 1e-6:
+                rows_r, reason_r, act_r, plan_r = build(id_ring)
+                if reason_r is None:
+                    new_od_r = rows_r[end_m]["new_OD"]
+                    red_r = end_od - new_od_r
+                    beta_r = new_od_r / r["leg_od_min"]
+                    if beta_r > ring_beta_max:
+                        reason_r = f"OD_end / OD_leg = {beta_r:.2f} above {ring_beta_max}"
+                    elif red_r < min_ring_reduction * end_od:
+                        reason_r = (f"OD reduction {red_r:.1f} cm below "
+                                    f"{min_ring_reduction * end_od:.1f} cm ({min_ring_reduction:.0%} of end OD)")
+                if reason_r is None:
+                    choice = ("rings", id_ring, gov_ring, rows_r, act_r, plan_r)
+                else:
+                    ring_reason = reason_r
+
+            # without rings
+            if choice is None:
+                rows_p, reason_p, act_p, plan_p = build(id_plain)
+                if reason_p is None and end_od - rows_p[end_m]["new_OD"] <= 0:
+                    reason_p = "no reduction possible"
+                if reason_p is None:
+                    choice = ("reduced_no_IRS", id_plain, gov_plain, rows_p, act_p, plan_p)
+                else:
+                    failed[side] = reason_p + (f" (rings: {ring_reason})" if ring_reason else "")
+                    continue
+
+            status, new_id, governing, side_rows, cone_action, plan = choice
+
+            if plan is not None:
+                taken_spans.append(plan["span"])
+                if cone_log is not None:
+                    cone_log.append({"chain": chain_name, "end_joint": r["end_joint"],
+                                     "end_member": end_m, "status": "inserted",
+                                     "reason": "leg end: stub partly reduced",
+                                     **plan["info"], "cone_OD_L": plan["od_l"],
+                                     "cone_OD_S": plan["od_s"], "cone_THK": plan["thk"]})
+
+            new_od = side_rows[end_m]["new_OD"]
+            fls_brace, fls_leg = fls_estimate(side_rows)
+            rec.update({"status": status, "reason": "",
+                        "rings_rejected_because": ring_reason or "",
+                        "UC_SL_governing": sl_gov, "size_governed_by": governing,
+                        "middle_ID": target_id, "stub_new_ID": new_id, "end_new_OD": new_od,
+                        "OD_ratio_final": new_od / r["leg_od_min"],
+                        "reduction_cm": end_od - new_od,
+                        "stub_reaches_middle_ID": new_id <= target_id + 1e-6,
+                        "cone_action": cone_action,
+                        "FLS_est_brace": fls_brace, "FLS_est_leg": fls_leg,
+                        "end_UC_SL_estimated": val(end_d["UC_SL"]) * area(end_od, end_d["THK"])
+                                               / area(new_od, end_d["THK"])})
+            rows.update(side_rows)
+
+        return rows, failed
+
+    # =====================================================================
+    # 8. Combine: take leg-end stubs out, plan cones elsewhere, size, then the stubs
+    # =====================================================================
     while True:
-        passed, details, failed = compute_verification(seg_red)
-        if passed:
+        pending_cone_log = []
+        removed = {m for r in ring_ends.values() for m in r["stub"] + ([r["cone"]] if r["cone"] else [])}
+        data_ring = {m: d for m, d in data0.items() if m not in removed}
+
+        plans, result = plan_and_size(data_ring, set(ring_ends), pending_cone_log)
+
+        cone_log_before = len(cone_log) if cone_log is not None else 0
+        ring_rows, failed = size_ring_ends(result, data_ring, plans)
+
+        if not failed:
             break
-        to_drop = {i for i in failed if seg_red[i] > 0}
-        if not to_drop:
-            return {}
-        for i in to_drop:
-            seg_red[i] = 0.0
 
-    # --- 4. Keep only members whose section actually changed ---
-    return {member_id: sec for member_id, sec in details.items()
-            if is_changed(member_id, sec)}
+        if cone_log is not None:
+            del cone_log[cone_log_before:]
+        for side, reason in failed.items():
+            rec = ring_ends[side]["rec"]
+            rec["reason"] = reason
+            if ring_log is not None:
+                ring_log.append(rec)
+            del ring_ends[side]
 
+    if cone_log is not None:
+        cone_log.extend(pending_cone_log)
+    if ring_log is not None:
+        ring_log.extend(r["rec"] for r in ring_ends.values())
+
+    # --- Output ---
+    virtual = {p["cone_id"] for p in plans} | {p["rem_id"] for p in plans}
+    out = {m: {**sec, "action": "resize"} for m, sec in result.items() if m not in virtual}
+
+    for p in plans:
+        rem = result[p["rem_id"]]
+        cone = result[p["cone_id"]]
+        row = {**rem, "action": "insert_cone",
+               "cone_start_joint": p["start"], "cone_length": cone_length}
+        row.update({"cone_" + key: v for key, v in cone.items()})
+        out[p["next_id"]] = row
+
+        p["rec"].update({"status": "inserted", "reason": "",
+                         "remainder_new_OD": rem["new_OD"],
+                         "reduction_cm": p["reduction"],
+                         "cone_OD_L": cone["new_OD_L"], "cone_OD_S": cone["new_OD_S"],
+                         "cone_THK": cone["new_THK"]})
+        if cone_log is not None:
+            cone_log.append(p["rec"])
+
+    out.update(ring_rows)
+    return out
 
 ZONE_ORDER = ["below", "in", "above"]
 
@@ -617,10 +1138,15 @@ def get_member_zones(model, upper, lower, z_max=21.5, csv_path="member_zones.csv
 
     return member_zones
 
-def apply_updated_sections(model_out, updated_members, member_zones, tol=0.01, fy_factor=1.0):
+def apply_updated_sections(model_out, updated_members, member_zones, tol=0.01, fy_factor=1.0,
+                           cone_log=None):
     """
-    fy_factor: converts new_FY from expected_FY units to SACS GRUP units
-               (e.g. 0.1 if expected_FY returns MPa and the model uses kN/cm2).
+    Applies the sizes from get_final_colinear_sections.
+    - action "resize": reuse a matching group in the zone or clone and resize one.
+    - action "insert_cone": split the member cone_length from cone_start_joint, make the
+      piece at that joint a cone (large end at joint1) and resize the remainder.
+    - action "cone_to_tube": turn an existing cone into a tube (ring ends).
+    fy_factor: converts new_FY to SACS GRUP units (1.0 if already kN/cm2).
     """
     zone_by_id = dict(zip(member_zones["member_id"], member_zones["zone"]))
 
@@ -635,6 +1161,9 @@ def apply_updated_sections(model_out, updated_members, member_zones, tol=0.01, f
             return float(sec.THK1), float(sec.THK2)
         return float(m.THK), float(m.THK)
 
+    def to_fy(value, current):
+        return float(current) if value is None or pd.isna(value) else round(float(value) * fy_factor, 2)
+
     def size_of(m):
         fy = float(m.FY)
         if m.is_cone:
@@ -642,7 +1171,7 @@ def apply_updated_sections(model_out, updated_members, member_zones, tol=0.01, f
         return ("TUB", float(m.OD), float(m.THK), fy)
 
     def new_size_of(m, new):
-        fy = float(m.FY) if new.get("new_FY") is None else round(float(new["new_FY"]) * fy_factor, 2)
+        fy = to_fy(new.get("new_FY"), m.FY)
         if m.is_cone:
             cur_thk1, cur_thk2 = cone_end_thks(m)
             thk1 = cur_thk1 if new["new_THK1"] is None else float(new["new_THK1"])
@@ -652,8 +1181,8 @@ def apply_updated_sections(model_out, updated_members, member_zones, tol=0.01, f
         return ("TUB", float(new["new_OD"]), float(new["new_THK"]), fy)
 
     def find_group(zone, size):
-        for (z, s), group_id in catalogue.items():
-            if z == zone and s[0] == size[0] and all(abs(a - b) <= tol for a, b in zip(s[1:], size[1:])):
+        for (z, sz), group_id in catalogue.items():
+            if z == zone and sz[0] == size[0] and all(abs(a - b) <= tol for a, b in zip(sz[1:], size[1:])):
                 return group_id
         return None
 
@@ -666,46 +1195,96 @@ def apply_updated_sections(model_out, updated_members, member_zones, tol=0.01, f
     existing_group_ids = set(model_out.groups)
     changes = {}   # member_id -> (old_group, new_group, created)
 
-    for member_id, new in updated_members.items():
-        m = model_out.members[member_id]
-        zone = zone_by_id.get(member_id)
-        if zone is None:
-            continue
-        size = new_size_of(m, new)
+    def assign_size(m, zone, size):
+        """Give member m the size: reuse a matching group in its zone or clone a new one."""
         old_group = m.group_id
 
-        # a matching size (incl. FY) already exists in this zone: reuse its group
         group_id = find_group(zone, size)
         if group_id is not None:
             m.group_id = group_id
-            changes[member_id] = (old_group, group_id, False)
-            continue
+            return old_group, group_id, False
 
-        # otherwise clone the member's group and give the clone the new size and FY
         new_group_id = s.generate_unique_group(existing_group_ids, old_group)
         new_group = model_out.groups[old_group].clone_group(model_out, new_group_id)
-
         seg = new_group.segments[0]
         sec = model_out.sections[seg.section_id] if seg.section_id != "" else None
 
-        if m.is_cone:
+        if size[0] == "CON":
             _, od_l, od_s, thk, thk1, thk2, fy = size
-            if sec:
-                sec.OD_L, sec.OD_S, sec.THK = od_l, od_s, thk
-                sec.THK1, sec.THK2 = thk1, thk2
-            else:
-                print(f"Cone {member_id}: no section, cone not written")
+            if sec is None or sec.stype != "CON":
+                # group came from a tube: give it a new CON section
+                sec = Section(section_id=model_out.make_unique_section_id("CONE00"), stype="CON",
+                              OD_L=od_l, OD_S=od_s, THK=thk, THK1=thk1, THK2=thk2)
+                model_out.add_section(sec)
+                seg.section_id = sec.Id
+                seg.OD, seg._THK = "", ""
+            sec.OD_L, sec.OD_S, sec.THK = od_l, od_s, thk
+            sec.THK1, sec.THK2 = thk1, thk2
         else:
             _, od, thk, fy = size
+            if sec is not None and sec.stype == "CON":
+                # group came from a cone: drop the CON section, define the tube on the GRUP card
+                seg.section_id = ""
+                sec = None
             seg.OD, seg._THK = od, thk
             if sec:
                 sec.OD, sec.THK = od, thk
 
         seg.FY = fy
-
         catalogue[(zone, size)] = new_group_id
         m.group_id = new_group_id
-        changes[member_id] = (old_group, new_group_id, True)
+        return old_group, new_group_id, True
+
+    for member_id, new in updated_members.items():
+        m = model_out.members.get(member_id)
+        zone = zone_by_id.get(member_id)
+        if m is None or zone is None:
+            continue
+
+        action = new.get("action", "resize")
+
+        if action == "insert_cone":
+            start = new["cone_start_joint"]
+            cone_len = float(new["cone_length"])
+            parent_j1 = m.joint1_id
+            ratio = cone_len / m.length if parent_j1 == start else 1.0 - cone_len / m.length
+
+            new_joint, m1, m2 = m.split_member_at_ratio(ratio)
+            cone_m, rem_m = (m1, m2) if parent_j1 == start else (m2, m1)
+            if cone_m.joint1_id != start:
+                cone_m.invert()          # large end must be at joint1 (stub side)
+
+            zone_by_id[cone_m.Id] = zone
+            zone_by_id[rem_m.Id] = zone
+
+            cone_thk = float(new["cone_new_THK"])
+            thk1 = new.get("cone_new_THK1")
+            thk2 = new.get("cone_new_THK2")
+            cone_size = ("CON", float(new["cone_new_OD_L"]), float(new["cone_new_OD_S"]), cone_thk,
+                         cone_thk if thk1 is None else float(thk1),
+                         cone_thk if thk2 is None else float(thk2),
+                         to_fy(new.get("cone_new_FY"), m.FY))
+            rem_size = ("TUB", float(new["new_OD"]), float(new["new_THK"]),
+                        to_fy(new.get("new_FY"), m.FY))
+
+            changes[cone_m.Id] = assign_size(cone_m, zone, cone_size)
+            changes[rem_m.Id] = assign_size(rem_m, zone, rem_size)
+
+            if cone_log is not None:
+                for rec in cone_log:
+                    if rec.get("next_member") == member_id and rec.get("status") == "inserted":
+                        rec.update({"new_joint": new_joint.Id,
+                                    "cone_member": cone_m.Id, "cone_group": cone_m.group_id,
+                                    "remainder_member": rem_m.Id, "remainder_group": rem_m.group_id})
+            continue
+
+        if action == "cone_to_tube":
+            tube_size = ("TUB", float(new["new_OD"]), float(new["new_THK"]),
+                         to_fy(new.get("new_FY"), m.FY))
+            changes[member_id] = assign_size(m, zone, tube_size)
+            continue
+
+        changes[member_id] = assign_size(m, zone, new_size_of(m, new))
 
     return model_out, changes
 

@@ -9126,7 +9126,7 @@ def assign_unique_groups(model, z_max):
         # --- Z filter: skip members above z_max ---
         z1 = member.coord1[2]
         z2 = member.coord2[2]
-        if max(z1, z2) > z_max:
+        if max(z1, z2) > z_max or (not member.is_tube and not member.is_cone):
             continue
 
         base_gid = member.group_id
@@ -9758,17 +9758,17 @@ def collect_fatigue_UCs_II(Fatigue_Results, model, joint_data):
 
 
 UC_COLOR_SCALE = {
-    0.0: "173 216 230",   # light blue
-    0.1: "135 206 250",   # sky blue
-    0.2: "0   191 255",   # deep sky blue
-    0.3: "0   128 255",   # blue
-    0.4: "0   255 255",   # cyan
-    0.5: "0   255 128",   # green-cyan
+    0.0: "210 210 210",   # light grey
+    0.1: "150 175 255",   # cornflower blue
+    0.2: "120 200 255",   # sky blue
+    0.3: "90  210 255",   # azure (bluer)
+    0.4: "60  235 210",   # turquoise
+    0.5: "150 240 110",   # light green
     0.6: "0   255 0",     # green
     0.7: "255 255 0",     # yellow
     0.8: "255 100 0",     # orange
-    0.9: "255 80 0",     # deep orange
-    1.0: "255 40  0",      # orange-red
+    0.9: "255 80  0",     # deep orange
+    1.0: "255 40  0",     # orange-red
 }
 
 UC_OVER_1_COLOR = "255 0   0"
