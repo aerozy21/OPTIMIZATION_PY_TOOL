@@ -2336,6 +2336,63 @@ def calc_effective_length_params(model, member, eff_params, z_max, braces_to_avo
 
     return eff_params
 
+import numpy as np
+
+def is_X_brace(model, joint, skip_exact=None, skip_prefix=None,
+               plane_tol=0.02, side_tol=1e-3):
+    """
+    True if the joint is an X-brace node:
+      1. no chord is a leg
+      2. all chords and braces at the joint are coplanar
+      3. braces lie on both sides of the chord within that plane
+
+    plane_tol : max |v . n| for a unit member vector to count as in-plane
+                (sine of the out-of-plane angle; 0.02 ~ 1.1 deg)
+    side_tol  : below this, a brace is treated as collinear with the chord
+    """
+    chdbrcs = get_joint_members(joint, skip_exact, skip_prefix)
+    braces = chdbrcs['braces']
+    chords = chdbrcs.get('chords', braces[:1] if braces else [])
+
+    if not chords:
+        return False
+
+    # 1. chord must not be a leg
+    if any(m.is_leg for m in chords):
+        return False
+
+    chord_ids = {m.Id for m in chords}
+    braces = [m for m in braces if m.Id not in chord_ids]
+    if len(braces) < 2:
+        return False
+
+    # unit vectors pointing away from the joint
+    chord_dir = chords[0].outer_vector(joint.Id)
+    vectors = [m.outer_vector(joint.Id) for m in chords + braces]
+
+    # 2. plane normal from the first non-collinear pair with the chord
+    normal = None
+    for v in vectors[1:]:
+        n = np.cross(chord_dir, v)
+        norm = np.linalg.norm(n)
+        if norm > side_tol:
+            normal = n / norm
+            break
+    if normal is None:            # everything collinear
+        return False
+
+    if any(abs(np.dot(v, normal)) > plane_tol for v in vectors):
+        return False              # multi-plane joint
+
+    # 3. braces on both sides of the chord
+    sides = set()
+    for b in braces:
+        s = np.dot(np.cross(chord_dir, b.outer_vector(joint.Id)), normal)
+        if abs(s) > side_tol:
+            sides.add(np.sign(s))
+
+    return len(sides) == 2
+
 def calc_effective_length_scan(model, member, z_max, skip_exact, skip_prefix):
     is_right_direction  = True
     
@@ -2344,7 +2401,7 @@ def calc_effective_length_scan(model, member, z_max, skip_exact, skip_prefix):
    # Initialize lists to hold member and joint objects for clarity and explicit handling
     member_list = [central_member]  # Start with central member included
     joint_list = []
-    angle_tolerance = 1
+    angle_tolerance = 15
   # Determine the direction flags for iteration
     direction_flags = [True, False]  # True for right, False for left
 
@@ -2396,14 +2453,19 @@ def calc_effective_length_scan(model, member, z_max, skip_exact, skip_prefix):
         target_ratio = 0.4
     
     is_jtube = group_id.startswith("JT")
-    is_xbrace = group_id.startswith("X")
 
     joint_ids = [joint.Id for joint in joint_list]
+
+    if "3619" in joint_ids:
+        a = 1
+    
     
     My_constraints = []
     Mz_constraints = []
+    
     #' Find hard point constraints only mid joints
     for joint in joint_list[1:-1]: 
+        
         if len(joint.AttachedMembers) > 2:
             chdbrcs = get_joint_members(joint, skip_exact, skip_prefix)
             braces = chdbrcs['braces']
@@ -2449,40 +2511,39 @@ def calc_effective_length_scan(model, member, z_max, skip_exact, skip_prefix):
                                 if (OP1_proj_angle > 30 or OP2_proj_angle > 30) and (joint.Id not in Mz_constraints):
                                     Mz_constraints.append(joint.Id)
     # ******************* CALCULATE ACTUAL LENGTHS BETWEEN CONSTRAINTS *************************
-    if member.Id == "3575-3512":
-        a = 1
-    My_constraints_ = get_effective_BCs(model, central_member, joint_ids, My_constraints)
-    Mz_constraints_ = get_effective_BCs(model, central_member, joint_ids, Mz_constraints)
+    # ******************* CALCULATE ACTUAL LENGTHS BETWEEN CONSTRAINTS *************************
 
-    # Left Side
-    canti_y = model.joints[Mz_constraints_[0]].is_cantilever
-    canti_z = model.joints[Mz_constraints_[1]].is_cantilever
-    canti_f_y = 2 if canti_y else 1
-    canti_f_z = 2 if canti_z else 1
-    # Handle effective length in Z-direction
-    left_joint_coord_y = model.joints[My_constraints_[0]].coord
-    left_joint_coord_z = model.joints[Mz_constraints_[0]].coord
-    right_joint_coord_y = model.joints[My_constraints_[1]].coord
-    right_joint_coord_z = model.joints[Mz_constraints_[1]].coord
-    
-    Ly = distance.euclidean(left_joint_coord_y, right_joint_coord_y)  * canti_f_y
-    Lz = distance.euclidean(left_joint_coord_z, right_joint_coord_z)  * canti_f_z
+    def _is_cantilever(jid):
+        return len(model.joints[jid].AttachedMembers) == 1
 
-  
-    
+    def _span(bounds):
+        j0, j1 = model.joints[bounds[0]], model.joints[bounds[1]]
+        L = distance.euclidean(j0.coord, j1.coord)
+        return L * (2 if (_is_cantilever(bounds[0]) or _is_cantilever(bounds[1])) else 1)
 
+    xbrace_cache = {}
+    def _is_x(jid):
+        if jid not in xbrace_cache:
+            xbrace_cache[jid] = is_X_brace(model, model.joints[jid], skip_exact, skip_prefix)
+        return xbrace_cache[jid]
 
-    if is_leg or is_jtube: 
-        ky, kz = 0.9, 0.9
-    elif is_xbrace:
-        ky, kz = 0.8, 0.8
-    else:
-        ky, kz = 0.75, 0.75                 
+    results = {}
+    for m in member_list:
+        by = get_effective_BCs(model, m, joint_ids, My_constraints)
+        bz = get_effective_BCs(model, m, joint_ids, Mz_constraints)
 
-    Ly_final = Ly * ky
-    Ly_final = Lz * kz
+        is_xbrace = any(_is_x(jid) for jid in by + bz)
 
-    return Ly_final, Ly_final
+        if is_leg or is_jtube:
+            ky, kz = 0.9, 0.9
+        elif is_xbrace:
+            ky, kz = 0.8, 0.8
+        else:
+            ky, kz = 0.75, 0.75
+
+        results[m.Id] = (_span(by) * ky, _span(bz) * kz)
+
+    return results
 
 # def calc_effective_length_params_original(model, member, eff_params, z_max, braces_to_avoid):
 #     # member = model.FindMember("2113-2143")
@@ -4059,7 +4120,42 @@ def get_unconstrained_list(model, joint_ids, central_id, constraint_ids):
 
     return left_, central_id, right_
 
-def get_effective_BCs(model, central_member, joint_ids, constraint_ids):
+def get_effective_BCs(model, central_member, joint_ids, constraints):
+    """
+    Return the two joint ids that bound central_member along joint_ids.
+
+    Bounds are the extreme ends of joint_ids plus any constraint joints.
+    joint_ids must be ordered along the member line.
+    Returns [lower_bound_id, upper_bound_id].
+    """
+    index = {jid: i for i, jid in enumerate(joint_ids)}
+    j1 = central_member.joint1_id
+    j2 = central_member.joint2_id
+
+
+    try:
+        i1 = index[j1]
+        i2 = index[j2]
+    except KeyError as e:
+        raise ValueError(f"Member {central_member.Id}: joint {e} not in joint_ids")
+
+    # print(joint_ids)
+    # print(constraints)
+
+    i_lo, i_hi = min(i1, i2), max(i1, i2)
+
+    # boundary positions: both ends + constraints that lie on this line
+    bounds = {0, len(joint_ids) - 1}
+    bounds |= {index[jid] for jid in constraints if jid in index}
+
+    lower = max(b for b in bounds if b <= i_lo)
+    upper = min(b for b in bounds if b >= i_hi)
+    lower_joint = joint_ids[lower]
+    upper_joint = joint_ids[upper]
+    
+    return [lower_joint, upper_joint]
+
+def get_effective_BCs_old(model, central_member, joint_ids, constraint_ids):
     j1 = central_member.joint1.Id
     j2 = central_member.joint2.Id
 
@@ -9803,4 +9899,232 @@ def insert_group_colors(file_path, member_UCs_df):
 
     print(f"[GCOL] Inserted {member_UCs_df.shape[0]} UC color lines.")
 
+def get_X_brace_data(model, joint, skip_exact=None, skip_prefix=None,
+                     plane_tol=0.02, side_tol=1e-3):
+    """
+    If the joint is an X-brace node, return (members, normal):
+      members : chords + braces at the joint (no duplicates)
+      normal  : unit normal of the X plane
+    Otherwise return None.
 
+    X-brace node:
+      1. no chord is a leg
+      2. all chords and braces at the joint are coplanar
+      3. braces lie on both sides of the chord within that plane
+    """
+    chdbrcs = get_joint_members(joint, skip_exact, skip_prefix)
+    braces = chdbrcs['braces']
+    chords = chdbrcs.get('chords', braces[:1] if braces else [])
+
+    if not chords or any(m.is_leg for m in chords):
+        return None
+
+    chord_ids = {m.Id for m in chords}
+    braces = [m for m in braces if m.Id not in chord_ids]
+    if len(braces) < 2:
+        return None
+
+    chord_dir = chords[0].outer_vector(joint.Id)
+    vectors = [m.outer_vector(joint.Id) for m in chords + braces]
+
+    # plane normal from the chord and the first non-collinear member
+    normal = None
+    for v in vectors[1:]:
+        n = np.cross(chord_dir, v)
+        if np.linalg.norm(n) > side_tol:
+            normal = n / np.linalg.norm(n)
+            break
+    if normal is None:
+        return None
+
+    # coplanarity
+    if any(abs(np.dot(v, normal)) > plane_tol for v in vectors):
+        return None
+
+    # braces on both sides of the chord
+    sides = set()
+    for b in braces:
+        s = np.dot(np.cross(chord_dir, b.outer_vector(joint.Id)), normal)
+        if abs(s) > side_tol:
+            sides.add(np.sign(s))
+    if len(sides) != 2:
+        return None
+
+    return chords + braces, normal
+
+
+def export_x_braces(model, groups_to_skip, z_max=None, angle_tol=1.0,
+                    skip_column="Buckling Length Braces"):
+    """
+    Return a dataframe with one row per X joint and the members of each branch
+    (TL, TR, BL, BR), listed from the X joint outwards, separated by ';'.
+
+    groups_to_skip : dataframe of skip rules; skip_column selects which list
+                     (3-char entries = exact group ids, 1-2 char = prefixes)
+    """
+    # -----------------------------------------
+    # SKIP RULES
+    # -----------------------------------------
+    skip_exact = set()
+    skip_prefix = []
+    for g in groups_to_skip[skip_column].dropna().astype(str).str.strip():
+        if len(g) == 3:
+            skip_exact.add(g)
+        elif len(g) in (1, 2):
+            skip_prefix.append(g)
+
+    z = np.array([0.0, 0.0, 1.0])
+    rows = []
+
+    for joint in model.joints.values():
+        if len(joint.AttachedMembers) < 4:
+            continue
+        if z_max is not None and joint.Z > z_max:
+            continue
+        data = get_X_brace_data(model, joint, skip_exact, skip_prefix)
+        if data is None:
+            continue
+        members, normal = data
+        if len(members) != 4:
+            print(f"[X] {joint.Id}: {len(members)} members, skipped")
+            continue
+
+        # in-plane quadrant axes
+        if abs(np.dot(normal, z)) < 0.5:
+            up = z - np.dot(z, normal) * normal
+            up /= np.linalg.norm(up)
+            right = np.cross(up, normal)
+            right /= np.linalg.norm(right)
+            ref = 0 if abs(right[0]) >= abs(right[1]) else 1
+            if right[ref] < 0:
+                right = -right
+        else:
+            up = np.array([0.0, 1.0, 0.0])
+            right = np.array([1.0, 0.0, 0.0])
+
+        row = {"X_joint": joint.Id}
+        for m in members:
+            v = m.outer_vector(joint.Id)
+            label = ("T" if np.dot(v, up) > 0 else "B") + \
+                    ("R" if np.dot(v, right) > 0 else "L")
+            if label in row:
+                print(f"[X] {joint.Id}: two branches in {label}, skipped")
+                break
+
+            # walk the branch outwards along colinear members
+            branch = [m]
+            visited = {m.Id}
+            current = m
+            jid = m.joint2_id if m.joint1_id == joint.Id else m.joint1_id
+            while True:
+                if z_max is not None and model.joints[jid].Z > z_max:
+                    break
+                nxt = None
+                for cand in model.joints[jid].AttachedMembers:
+                    gid = cand.group_id
+                    if (cand.Id in visited or gid in skip_exact
+                            or any(gid.startswith(p) for p in skip_prefix)):
+                        continue
+                    if math.degrees(member_angle_min(current, cand)) < angle_tol:
+                        nxt = cand
+                        break
+                if nxt is None:
+                    break
+                branch.append(nxt)
+                visited.add(nxt.Id)
+                current = nxt
+                jid = nxt.joint2_id if nxt.joint1_id == jid else nxt.joint1_id
+
+            row[label] = ";".join(b.Id for b in branch)
+        else:
+            rows.append(row)
+
+    df = pd.DataFrame(rows, columns=["X_joint", "TL", "TR", "BL", "BR"])
+    return df
+
+import numpy as np
+import pandas as pd
+
+BRANCHES = ["TL", "TR", "BL", "BR"]
+OPPOSITE = {"TL": "BR", "BR": "TL", "TR": "BL", "BL": "TR"}
+DIAGONAL = {"TL": "D1", "BR": "D1", "TR": "D2", "BL": "D2"}
+
+
+def get_x_brace_states(expanded_df, x_df, tension_positive=True, tension_tol=0.0):
+    """
+    One row per (paths, loads, X_joint) with the axial force at the X node
+    of the four branches (N_TL, N_TR, N_BL, N_BR) and the state of each
+    diagonal (D1 = TL+BR, D2 = TR+BL): 'T' if both halves are in tension
+    beyond tension_tol, otherwise 'C'.
+
+    tension_positive : True if SACS reports tension as positive FX
+    """
+    # first member of each branch and which end sits on the X joint
+    first = []
+    for _, r in x_df.iterrows():
+        for b in BRANCHES:
+            m = r[b].split(";")[0]
+            end = "A" if m.split("-")[0] == r["X_joint"] else "B"
+            first.append((r["X_joint"], b, m, end))
+    first = pd.DataFrame(first, columns=["X_joint", "branch", "member", "end"])
+
+    sub = expanded_df.loc[expanded_df["member"].isin(first["member"]),
+                          ["member", "paths", "loads", "FXA", "FXB"]]
+    sub = sub.merge(first, on="member")
+    sub["N"] = np.where(sub["end"] == "A", sub["FXA"], sub["FXB"])
+
+    states = sub.pivot_table(index=["paths", "loads", "X_joint"],
+                             columns="branch", values="N", aggfunc="first")
+    states = states.reindex(columns=BRANCHES)
+
+    sign = 1.0 if tension_positive else -1.0
+    t = (states * sign) > tension_tol
+    states["D1"] = np.where(t["TL"] & t["BR"], "T", "C")
+    states["D2"] = np.where(t["TR"] & t["BL"], "T", "C")
+
+    states = states.rename(columns={b: f"N_{b}" for b in BRANCHES})
+    return states.reset_index()
+
+
+def apply_x_brace_lengths(expanded_df, x_df, states_df):
+    """
+    Overwrite Ly and Lz of X-brace members per load case, using the
+    existing effective lengths (K already applied):
+      other diagonal in tension (C-T)     -> min(Ly, Lz) for both
+      other diagonal in compression (C-C) -> max(Ly, Lz) for both
+    Adds X_joint, X_state, Ly_orig, Lz_orig.
+    """
+    # member -> X joint and diagonal
+    rows = []
+    for _, r in x_df.iterrows():
+        for b in BRANCHES:
+            for m in r[b].split(";"):
+                rows.append((m, r["X_joint"], DIAGONAL[b]))
+    xmap = pd.DataFrame(rows, columns=["member", "X_joint", "diag"])
+
+    dup = xmap["member"].duplicated(keep="first")
+    if dup.any():
+        print(f"[X] {dup.sum()} member(s) in more than one X brace, first kept: "
+              f"{xmap.loc[dup, 'member'].tolist()[:10]}")
+        xmap = xmap[~dup]
+
+    df = expanded_df.merge(xmap, on="member", how="left")
+    df = df.merge(states_df[["paths", "loads", "X_joint", "D1", "D2"]],
+                  on=["paths", "loads", "X_joint"], how="left")
+
+    is_d1 = df["diag"] == "D1"
+    own = pd.Series(np.where(is_d1, df["D1"], df["D2"]), index=df.index)
+    other = pd.Series(np.where(is_d1, df["D2"], df["D1"]), index=df.index)
+
+    mask = df["X_joint"].notna() & other.notna()
+    df["X_state"] = np.where(mask, own.astype(str) + "-" + other.astype(str), "")
+
+    df["Ly_orig"] = df["Ly"]
+    df["Lz_orig"] = df["Lz"]
+    L_short = df[["Ly", "Lz"]].min(axis=1)
+    L_long = df[["Ly", "Lz"]].max(axis=1)
+    L = np.where((own == "C") & (other == "C"), L_long, L_short)
+    df.loc[mask, "Ly"] = L[mask]
+    df.loc[mask, "Lz"] = L[mask]
+
+    return df.drop(columns=["diag", "D1", "D2"])
